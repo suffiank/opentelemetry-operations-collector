@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+	"github.com/shirou/gopsutil/v3/process"
 	"go.uber.org/zap"
 )
 
@@ -37,6 +38,7 @@ type nvmlClient struct {
 	devicesUUID                    []string
 	deviceToLastSeenTimestamp      map[nvml.Device]uint64
 	deviceMetricToFailedQueryCount map[string]uint64
+	collectProcessInfo             bool
 }
 
 type nvmlMetric struct {
@@ -44,6 +46,19 @@ type nvmlMetric struct {
 	gpuIndex uint
 	name     string
 	value    [8]byte
+}
+
+type processMetric struct {
+	time                   time.Time
+	gpuIndex               uint
+	processPid             int
+	runningTime            time.Duration
+	lifetimeGpuUtilization uint64
+	lifetimeGpuMaxMemory   uint64
+	processName            string
+	command                string
+	commandLine            string
+	owner                  string
 }
 
 // calling nvml.Init() twice causes an unnecessary error (also wrap here for mocking)
@@ -58,17 +73,29 @@ var nvmlInit = func() nvml.Return {
 
 var nvmlDeviceGetSamples = nvml.DeviceGetSamples
 var nvmlDeviceGetMemoryInfo = nvml.DeviceGetMemoryInfo
+var nvmlDeviceSetAccountingMode = nvml.DeviceSetAccountingMode
+var nvmlDeviceGetAccountingPids = nvml.DeviceGetAccountingPids
 
 func newClient(config *Config, logger *zap.Logger) (*nvmlClient, error) {
 	nvmlCleanup, err := initializeNvml(logger)
 	if err != nil {
-		logger.Sugar().Warnf("Unable to find and/or initialize Nvidia Management Library on '%v'. No Nvidia device metrics will be collected.", err)
+		logger.Sugar().Warnf("Unable to find and/or initialize Nvidia Management Library on '%w'. No Nvidia device metrics will be collected.", err)
 		return &nvmlClient{logger: logger.Sugar(), disable: true}, nil
 	}
 
 	devices, names, UUIDs, err := discoverDevices(logger)
 	if err != nil {
 		return nil, err
+	}
+
+	collectProcessInfo := config.Metrics.NvmlGpuProcessesLifetimeUtilization.Enabled ||
+		config.Metrics.NvmlGpuProcessesMaxBytesUsed.Enabled
+	if collectProcessInfo {
+		err = enableProcessAccountingMode(logger, devices)
+		if err != nil {
+			logger.Sugar().Warnf("Unable to enable process metrics collection on %w. No Nvidia process metrics will be collected.", err)
+			collectProcessInfo = false
+		}
 	}
 
 	return &nvmlClient{
@@ -80,6 +107,7 @@ func newClient(config *Config, logger *zap.Logger) (*nvmlClient, error) {
 		devicesUUID:                    UUIDs,
 		deviceToLastSeenTimestamp:      make(map[nvml.Device]uint64),
 		deviceMetricToFailedQueryCount: make(map[string]uint64),
+		collectProcessInfo:             collectProcessInfo,
 	}, nil
 }
 
@@ -157,6 +185,19 @@ func discoverDevices(logger *zap.Logger) ([]nvml.Device, []string, []string, err
 	}
 
 	return devices, names, UUIDs, nil
+}
+
+func enableProcessAccountingMode(logger *zap.Logger, devices []nvml.Device) error {
+	for gpuIndex, device := range devices {
+		ret := nvmlDeviceSetAccountingMode(device, nvml.FEATURE_ENABLED)
+		if ret != nvml.SUCCESS {
+			return fmt.Errorf("Unable to set process accounting mode for Nvidia device %d on '%s'", gpuIndex, nvml.ErrorString(ret))
+		}
+
+		logger.Sugar().Infof("Successfully enabled process accounting mode for Nvidia device %d", gpuIndex)
+	}
+
+	return nil
 }
 
 func (client *nvmlClient) cleanup() error {
@@ -276,6 +317,99 @@ func (client *nvmlClient) collectDeviceMemoryInfo() []nvmlMetric {
 	}
 
 	return deviceMetrics
+}
+
+func (client *nvmlClient) collectProcessMetrics() []processMetric {
+	if client.disable || !client.collectProcessInfo {
+		return nil
+	}
+
+	processMetrics := make([]processMetric, 0)
+	for gpuIndex, device := range client.devices {
+		pids, ret := nvmlDeviceGetAccountingPids(device)
+		if ret != nvml.SUCCESS {
+			msg := fmt.Sprintf("Unable to query cached PIDs on '%v", nvml.ErrorString(ret))
+			client.issueWarningForFailedQueryUptoThreshold(gpuIndex, "nvml.processes", msg)
+			continue
+		}
+
+		for _, pid := range pids {
+			metricName := fmt.Sprintf("nvml.processes{pid=%d}", pid)
+
+			stats, ret := nvml.DeviceGetAccountingStats(device, uint32(pid))
+			if ret != nvml.SUCCESS {
+				msg := fmt.Sprintf("Unable to query pid %d account statistics on '%v", pid, nvml.ErrorString(ret))
+				client.issueWarningForFailedQueryUptoThreshold(gpuIndex, metricName, msg)
+				continue
+			}
+
+			if stats.IsRunning != 1 {
+				continue
+			}
+
+			metric := processMetric{
+				time:                   time.Now(),
+				processPid:             pid,
+				gpuIndex:               uint(gpuIndex),
+				runningTime:            time.Since(time.UnixMicro(int64(stats.StartTime))),
+				lifetimeGpuUtilization: uint64(stats.GpuUtilization),
+				lifetimeGpuMaxMemory:   stats.MaxMemoryUsage,
+			}
+
+			metric = client.setProcessMetadataLabels(metric)
+			processMetrics = append(processMetrics, metric)
+
+			client.logger.Debugf("Found running pid %d (owner %s command %s) has used Nvidia device %d\n",
+				metric.processPid, metric.owner, metric.commandLine, metric.gpuIndex)
+		}
+	}
+
+	return processMetrics
+}
+
+func (client *nvmlClient) setProcessMetadataLabels(metric processMetric) processMetric {
+	metricName := fmt.Sprintf("nvml.processes{pid=%d}.metadata", metric.processPid)
+
+	process, err := process.NewProcess(int32(metric.processPid))
+	if err != nil {
+		msg := fmt.Sprintf("Unable to obtain process handle for pid %d to query for metadata on '%v'", metric.processPid, err)
+		client.issueWarningForFailedQueryUptoThreshold(int(metric.gpuIndex), metricName, msg)
+		return metric
+	}
+
+	metric.processName, err = process.Name()
+	if err != nil {
+		msg := fmt.Sprintf("Unable to query pid %d process name on '%v'", metric.processPid, err)
+		client.issueWarningForFailedQueryUptoThreshold(int(metric.gpuIndex), metricName, msg)
+		return metric
+	}
+
+	metric.command, err = process.Cmdline()
+	if err != nil {
+		msg := fmt.Sprintf("Unable to query pid %d command on '%v'", metric.processPid, err)
+		client.issueWarningForFailedQueryUptoThreshold(int(metric.gpuIndex), metricName, msg)
+		return metric
+	}
+
+	metric.commandLine, err = process.Cmdline()
+	if err != nil {
+		msg := fmt.Sprintf("Unable to query pid %d command line on '%v'", metric.processPid, err)
+		client.issueWarningForFailedQueryUptoThreshold(int(metric.gpuIndex), metricName, msg)
+		return metric
+	}
+
+	if len(metric.commandLine) > 1024 {
+		metric.commandLine = metric.commandLine[:1024]
+	}
+
+	metric.owner, err = process.Username()
+	if err != nil {
+		msg := fmt.Sprintf("Unable to query pid %d username on '%v'", metric.processPid, err)
+		client.issueWarningForFailedQueryUptoThreshold(int(metric.gpuIndex), metricName, msg)
+		return metric
+	}
+
+	return metric
 }
 
 func (client *nvmlClient) issueWarningForFailedQueryUptoThreshold(deviceIdx int, metricName string, reason string) {
