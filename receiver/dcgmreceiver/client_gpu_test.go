@@ -20,6 +20,7 @@
 package dcgmreceiver
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -39,7 +40,7 @@ func TestNewDcgmClientWithGpuPresent(t *testing.T) {
 		assert.Greater(t, len(client.devicesModelName[gpuIndex]), 0)
 		assert.Greater(t, len(client.devicesUUID[gpuIndex]), 0)
 	}
-	assert.Equal(t, len(client.enabledfieldIDs), len(dcgmNameToMetricName))
+	assert.Equal(t, len(client.enabledFieldIDs), len(dcgmNameToMetricName))
 }
 
 func TestCollectGpuProfilingMetrics(t *testing.T) {
@@ -75,10 +76,6 @@ func TestCollectGpuProfilingMetrics(t *testing.T) {
 		assert.LessOrEqual(t, metric.gpuIndex, uint(32))
 
 		switch metric.name {
-		case "dcgm.gpu.profiling.sm_utilization":
-			fallthrough
-		case "dcgm.gpu.profiling.sm_occupancy":
-			fallthrough
 		case "dcgm.gpu.profiling.tensor_utilization":
 			fallthrough
 		case "dcgm.gpu.profiling.dram_utilization":
@@ -89,9 +86,14 @@ func TestCollectGpuProfilingMetrics(t *testing.T) {
 			fallthrough
 		case "dcgm.gpu.profiling.fp16_utilization":
 			fallthrough
-		case "dcgm.gpu.utilization":
+		case "dcgm.gpu.profiling.sm_occupancy":
+			fallthrough
+		case "dcgm.gpu.profiling.sm_utilization":
 			assert.GreaterOrEqual(t, metric.asFloat64(), float64(0.0))
 			assert.LessOrEqual(t, metric.asFloat64(), float64(1.0))
+		case "dcgm.gpu.utilization":
+			assert.GreaterOrEqual(t, metric.asInt64(), int64(0))
+			assert.LessOrEqual(t, metric.asInt64(), int64(100))
 		case "dcgm.gpu.memory.bytes_free":
 			fallthrough
 		case "dcgm.gpu.memory.bytes_used":
@@ -115,10 +117,12 @@ func TestCollectGpuProfilingMetrics(t *testing.T) {
 		assert.GreaterOrEqual(t, metric.timestamp, before)
 		assert.LessOrEqual(t, metric.timestamp, after)
 
-		seenMetric[metric.name] = true
+		seenMetric[fmt.Sprintf("gpu{%d}.metric{%s}", metric.gpuIndex, metric.name)] = true
 	}
 
-	for _, metric := range expectedMetrics {
-		assert.Equal(t, seenMetric[metric], true)
+	for _, gpuIndex := range client.deviceIndices {
+		for _, metric := range expectedMetrics {
+			assert.Equal(t, seenMetric[fmt.Sprintf("gpu{%d}.metric{%s}", gpuIndex, metric)], true)
+		}
 	}
 }

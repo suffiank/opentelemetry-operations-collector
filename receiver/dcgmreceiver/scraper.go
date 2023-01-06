@@ -37,8 +37,8 @@ type dcgmScraper struct {
 	mb       *metadata.MetricsBuilder
 }
 
-func newDcgmScraper(config *Config, settings receiver.CreateSettings) (*dcgmScraper, error) {
-	return &dcgmScraper{config: config, settings: settings}, nil
+func newDcgmScraper(config *Config, settings receiver.CreateSettings) *dcgmScraper {
+	return &dcgmScraper{config: config, settings: settings}
 }
 
 func (s *dcgmScraper) start(_ context.Context, host component.Host) error {
@@ -48,9 +48,9 @@ func (s *dcgmScraper) start(_ context.Context, host component.Host) error {
 		return err
 	}
 
-	starttime := pcommon.NewTimestampFromTime(time.Now())
+	startTime := pcommon.NewTimestampFromTime(time.Now())
 	s.mb = metadata.NewMetricsBuilder(
-		s.config.Metrics, s.settings.BuildInfo, metadata.WithStartTime(starttime))
+		s.config.Metrics, s.settings.BuildInfo, metadata.WithStartTime(startTime))
 
 	return nil
 }
