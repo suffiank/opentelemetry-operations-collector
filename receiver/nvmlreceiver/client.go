@@ -39,8 +39,7 @@ type nvmlClient struct {
 	devicesUUID                    []string
 	deviceToLastSeenTimestamp      map[nvml.Device]uint64
 	deviceMetricToFailedQueryCount map[string]uint64
-	collectProcessInfo             bool
-	lastProcessInfoCollection      time.Time
+	deviceToAccountingIsEnabled    map[nvml.Device]bool
 }
 
 type deviceMetric struct {
@@ -89,13 +88,9 @@ func newClient(config *Config, logger *zap.Logger) (*nvmlClient, error) {
 		return nil, err
 	}
 
-	collectProcessInfo := config.Metrics.NvmlGpuProcessesUtilization.Enabled || config.Metrics.NvmlGpuProcessesMaxBytesUsed.Enabled
-	if collectProcessInfo {
-		enableCount := enableProcessAccountingModeOnSupportingDevices(logger, devices)
-		if enableCount == 0 {
-			logger.Sugar().Warnf("Unable to enable process metrics collection on any NVIDIA devices. No Nvidia process metrics will be collected.", err)
-			collectProcessInfo = false
-		}
+	var deviceToAccountingIsEnabled map[nvml.Device]bool
+	if config.Metrics.NvmlGpuProcessesUtilization.Enabled || config.Metrics.NvmlGpuProcessesMaxBytesUsed.Enabled {
+		deviceToAccountingIsEnabled = enableProcessAccountingModeOnSupportingDevices(logger, devices)
 	}
 
 	return &nvmlClient{
@@ -107,8 +102,7 @@ func newClient(config *Config, logger *zap.Logger) (*nvmlClient, error) {
 		devicesUUID:                    UUIDs,
 		deviceToLastSeenTimestamp:      make(map[nvml.Device]uint64),
 		deviceMetricToFailedQueryCount: make(map[string]uint64),
-		collectProcessInfo:             collectProcessInfo,
-		lastProcessInfoCollection:      time.Now(),
+		deviceToAccountingIsEnabled:    deviceToAccountingIsEnabled,
 	}, nil
 }
 
@@ -214,20 +208,28 @@ func discoverDevices(logger *zap.Logger) ([]nvml.Device, []string, []string, err
 	return devices, names, UUIDs, nil
 }
 
-func enableProcessAccountingModeOnSupportingDevices(logger *zap.Logger, devices []nvml.Device) int {
-	enabledCount := 0
+func enableProcessAccountingModeOnSupportingDevices(logger *zap.Logger, devices []nvml.Device) map[nvml.Device]bool {
+	deviceToAccountingIsEnabled := make(map[nvml.Device]bool, len(devices))
+
+	enableCount := 0
 	for gpuIndex, device := range devices {
 		ret := nvmlDeviceSetAccountingMode(device, nvml.FEATURE_ENABLED)
 		if ret != nvml.SUCCESS {
 			logger.Sugar().Warnf("Unable to set process accounting mode for Nvidia device %d on '%s'.", gpuIndex, nvml.ErrorString(ret))
+			deviceToAccountingIsEnabled[device] = false
 			continue
 		}
 
 		logger.Sugar().Infof("Successfully enabled process accounting mode for Nvidia device %d.", gpuIndex)
-		enabledCount++
+		deviceToAccountingIsEnabled[device] = true
+		enableCount++
 	}
 
-	return enabledCount
+	if enableCount == 0 {
+		logger.Sugar().Warnf("Unable to enable process metrics collection on any NVIDIA devices. No Nvidia process metrics will be collected.")
+	}
+
+	return deviceToAccountingIsEnabled
 }
 
 func (client *nvmlClient) cleanup() error {
@@ -350,13 +352,17 @@ func (client *nvmlClient) collectDeviceMemoryInfo() []deviceMetric {
 }
 
 func (client *nvmlClient) collectProcessMetrics() []processMetric {
-	if client.disable || !client.collectProcessInfo {
+	if client.disable {
 		return nil
 	}
 
 	processMetrics := make([]processMetric, 0)
 
 	for gpuIndex, device := range client.devices {
+		if !client.deviceToAccountingIsEnabled[device] {
+			continue
+		}
+
 		pids, ret := nvmlDeviceGetAccountingPids(device)
 		if ret != nvml.SUCCESS {
 			msg := fmt.Sprintf("Unable to query cached PIDs on '%v", nvml.ErrorString(ret))
@@ -374,8 +380,7 @@ func (client *nvmlClient) collectProcessMetrics() []processMetric {
 				continue
 			}
 
-			startTime := time.UnixMicro(int64(stats.StartTime))
-			if stats.IsRunning != 1 && startTime.Before(client.lastProcessInfoCollection) {
+			if stats.IsRunning != 1 {
 				continue
 			}
 
@@ -400,7 +405,6 @@ func (client *nvmlClient) collectProcessMetrics() []processMetric {
 		}
 	}
 
-	client.lastProcessInfoCollection = time.Now()
 	return processMetrics
 }
 
